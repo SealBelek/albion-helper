@@ -1,4 +1,4 @@
-.PHONY: all build run lint tidy clean db-init db-reset
+.PHONY: all build run lint tidy clean db-reset
 
 BINARY := albion-helper
 CMD    := ./cmd/
@@ -21,11 +21,5 @@ tidy:
 clean:
 	rm -f $(BINARY)
 
-db-init:
-	python3 scripts/init-db.py
-	python3 scripts/prices-db.py
-	python3 scripts/world-db.py
-
 db-reset:
 	rm -f $(DB)
-	$(MAKE) db-init

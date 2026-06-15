@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"time"
 
+	"albion-helper/data"
 	"albion-helper/internal/db"
 	"albion-helper/internal/nats"
 	"albion-helper/internal/tui"
@@ -16,6 +18,9 @@ import (
 )
 
 func main() {
+	profile := flag.Bool("profile", false, "enable pprof HTTP server on localhost:6060")
+	flag.Parse()
+
 	database, err := db.Open("db/items.db")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
@@ -23,11 +28,18 @@ func main() {
 	}
 	defer database.Close()
 
+	if err := db.SeedData(database, data.Items, data.World); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to seed database: %v\n", err)
+		os.Exit(1)
+	}
+
 	db.StartCleanup(database, 5*time.Minute)
 
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
+	if *profile {
+		go func() {
+			log.Println(http.ListenAndServe("localhost:6060", nil))
+		}()
+	}
 
 	subscriber := nats.NewSubscriber(database)
 	go func() {
