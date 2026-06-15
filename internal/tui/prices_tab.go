@@ -114,7 +114,7 @@ type historyCheckMsg struct{}
 type historyFetchedMsg struct{}
 
 func (m PricesTabModel) tickRefresh() tea.Cmd {
-	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(10*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg{}
 	})
 }

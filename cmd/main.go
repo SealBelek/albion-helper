@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"time"
 
@@ -21,6 +24,10 @@ func main() {
 	defer database.Close()
 
 	db.StartCleanup(database, 5*time.Minute)
+
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 
 	subscriber := nats.NewSubscriber(database)
 	go func() {

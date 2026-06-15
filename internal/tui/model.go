@@ -3,6 +3,7 @@ package tui
 import (
 	"database/sql"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -112,6 +113,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		newTab, cmd := m.itemsTab.Update(msg)
 		m.itemsTab = newTab
 		if _, ok := msg.(trackedLoadedMsg); ok {
+			m.pricesTab.lastHistory = time.Time{}
 			_, cmd2 := m.pricesTab.Update(apiCheckMsg{})
 			return m, tea.Batch(cmd, cmd2)
 		}
