@@ -2,18 +2,14 @@ package tui
 
 import (
 	"fmt"
-	"math"
-	"sort"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"database/sql"
 
-	"albion-helper/internal/api"
-	"albion-helper/internal/db"
 	"albion-helper/internal/models"
+	"albion-helper/internal/service"
 )
 
 var (
@@ -30,7 +26,7 @@ type pricesLoadedMsg struct {
 }
 
 type PricesTabModel struct {
-	db          *sql.DB
+	priceSvc    service.PriceService
 	width       int
 	height      int
 	groups      []models.PriceItemGroup
@@ -40,10 +36,10 @@ type PricesTabModel struct {
 	lastHistory    time.Time
 }
 
-func NewPricesTabModel(database *sql.DB) PricesTabModel {
+func NewPricesTabModel(svc service.PriceService) PricesTabModel {
 	return PricesTabModel{
-		db:      database,
-		langIdx: 0,
+		priceSvc: svc,
+		langIdx:  0,
 	}
 }
 
@@ -71,18 +67,18 @@ func (m PricesTabModel) Update(msg tea.Msg) (PricesTabModel, tea.Cmd) {
 		if m.cursor < 0 {
 			m.cursor = 0
 		}
-		return m, m.tickRefresh()
+		return m, nil
 
 	case apiCheckMsg:
 		return m, tea.Batch(m.checkMissing(), m.tickCheck())
 
 	case apiFetchedMsg:
 		m.lastAPICheck = time.Now()
-		return m, m.refreshPrices()
+		return m, nil
 
 	case historyFetchedMsg:
 		m.lastHistory = time.Now()
-		return m, m.refreshPrices()
+		return m, nil
 
 	case historyCheckMsg:
 		m.lastHistory = time.Time{}
@@ -101,6 +97,8 @@ func (m PricesTabModel) Update(msg tea.Msg) (PricesTabModel, tea.Cmd) {
 			if m.cursor < len(m.groups)-1 {
 				m.cursor++
 			}
+		case "r":
+			return m, m.refreshPrices()
 		}
 	}
 
@@ -114,13 +112,13 @@ type historyCheckMsg struct{}
 type historyFetchedMsg struct{}
 
 func (m PricesTabModel) tickRefresh() tea.Cmd {
-	return tea.Tick(10*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(60*time.Second, func(t time.Time) tea.Msg {
 		return tickMsg{}
 	})
 }
 
 func (m PricesTabModel) tickCheck() tea.Cmd {
-	return tea.Tick(60*time.Second, func(t time.Time) tea.Msg {
+	return tea.Tick(120*time.Second, func(t time.Time) tea.Msg {
 		return apiCheckMsg{}
 	})
 }
@@ -132,39 +130,26 @@ func (m PricesTabModel) tickHistory() tea.Cmd {
 }
 
 func (m PricesTabModel) checkMissing() tea.Cmd {
-	database := m.db
-	lastHist := m.lastHistory
+	svc := m.priceSvc
 	return func() tea.Msg {
-		items, err := db.MissingTrackedItems(database)
-		if err != nil {
+		if err := svc.SyncMissingPrices(); err != nil {
 			return nil
 		}
-		if len(items) > 0 {
-			api.FetchPrices(database, items)
-		}
-		if time.Since(lastHist) > 5*time.Minute {
-			lang := db.Languages[0].Code
-			tracked, err := db.GetTrackedItems(database, lang)
-			if err == nil && len(tracked) > 0 {
-				api.FetchHistory(database, tracked)
-				return historyFetchedMsg{}
+		if svc.NeedsHistorySync(m.lastHistory) {
+			if err := svc.SyncHistory(); err != nil {
+				return nil
 			}
+			return historyFetchedMsg{}
 		}
 		return apiFetchedMsg{}
 	}
 }
 
 func (m PricesTabModel) fetchHistory() tea.Cmd {
-	database := m.db
-	langIdx := m.langIdx
+	svc := m.priceSvc
 	return func() tea.Msg {
-		lang := db.Languages[langIdx].Code
-		tracked, err := db.GetTrackedItems(database, lang)
-		if err != nil {
+		if err := svc.SyncHistory(); err != nil {
 			return nil
-		}
-		if len(tracked) > 0 {
-			api.FetchHistory(database, tracked)
 		}
 		return historyFetchedMsg{}
 	}
@@ -172,73 +157,16 @@ func (m PricesTabModel) fetchHistory() tea.Cmd {
 
 func (m PricesTabModel) refreshPrices() tea.Cmd {
 	langIdx := m.langIdx
-	database := m.db
+	svc := m.priceSvc
 	return func() tea.Msg {
-		lang := db.Languages[langIdx].Code
-		rows, err := db.GetPricesForTrackedItems(database, lang)
+		lang := models.Languages[langIdx].Code
+		groups, err := svc.GetPriceGroups(lang)
 		if err != nil {
 			return nil
 		}
 
-		groups := groupPrices(rows)
 		return pricesLoadedMsg{groups: groups}
 	}
-}
-
-func groupPrices(rows []models.PriceRow) []models.PriceItemGroup {
-	groupMap := make(map[string][]models.PriceRow)
-
-	for _, r := range rows {
-		groupMap[r.UniqueName] = append(groupMap[r.UniqueName], r)
-	}
-
-	var groups []models.PriceItemGroup
-	for key, cities := range groupMap {
-		hasData := false
-		filtered := cities[:0]
-		for _, c := range cities {
-			if c.City != "" && (c.BuyMax > 0 || c.SellMin > 0) {
-				hasData = true
-				filtered = append(filtered, c)
-			}
-		}
-
-		if !hasData {
-			groups = append(groups, models.PriceItemGroup{
-				UniqueName: key,
-				Name:       key,
-				HasData:    false,
-			})
-			continue
-		}
-
-		sort.Slice(filtered, func(i, j int) bool {
-			return filtered[i].Profit > filtered[j].Profit
-		})
-
-		bestCity := 0
-		bestProfit := -math.MaxFloat64
-		for i, c := range filtered {
-			if c.Profit > bestProfit {
-				bestProfit = c.Profit
-				bestCity = i
-			}
-		}
-
-		groups = append(groups, models.PriceItemGroup{
-			UniqueName: key,
-			Name:       key,
-			Cities:     filtered,
-			BestCity:   bestCity,
-			HasData:    hasData,
-		})
-	}
-
-	sort.Slice(groups, func(i, j int) bool {
-		return groups[i].UniqueName < groups[j].UniqueName
-	})
-
-	return groups
 }
 
 func (m *PricesTabModel) SetSize(w, h int) {
@@ -258,7 +186,7 @@ func (m PricesTabModel) View() string {
 	}
 	header += styleDimmed.Render(strings.Repeat("─", padLen))
 
-	var lines []string
+	lines := make([]string, 0, m.height+2)
 	lines = append(lines, header)
 
 	if len(m.groups) == 0 {
@@ -356,7 +284,8 @@ func (m PricesTabModel) View() string {
 		usedLines++
 	}
 
-	return strings.Join(lines, "\n")
+	result := strings.Join(lines, "\n")
+	return result
 }
 
 func formatPrice(price int) string {

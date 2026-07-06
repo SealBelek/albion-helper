@@ -22,4 +22,4 @@ clean:
 	rm -f $(BINARY)
 
 db-reset:
-	rm -f $(DB)
+	rm -f $(DB) $(DB)-shm $(DB)-wal

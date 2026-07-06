@@ -1,12 +1,13 @@
 package tui
 
 import (
-	"database/sql"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"albion-helper/internal/service"
 )
 
 type tab int
@@ -23,26 +24,36 @@ var (
 	styleHelp        = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 )
 
+var modelViewCache struct {
+	gen  uint64
+	view string
+}
+
 type Model struct {
-	db     *sql.DB
-	active tab
-	width  int
-	height int
+	itemSvc  service.ItemService
+	priceSvc service.PriceService
+	active   tab
+	width    int
+	height   int
 
 	itemsTab  ItemsTabModel
 	pricesTab PricesTabModel
+
+	viewGen uint64
 }
 
-func NewModel(database *sql.DB) Model {
-	it := NewItemsTabModel(database)
-	pt := NewPricesTabModel(database)
+func NewModel(itemSvc service.ItemService, priceSvc service.PriceService) Model {
+	it := NewItemsTabModel(itemSvc)
+	pt := NewPricesTabModel(priceSvc)
 	pt.SetLangIdx(it.langIdx)
 
 	return Model{
-		db:        database,
+		itemSvc:   itemSvc,
+		priceSvc:  priceSvc,
 		active:    tabItems,
 		itemsTab:  it,
 		pricesTab: pt,
+		viewGen:   1,
 	}
 }
 
@@ -60,9 +71,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.itemsTab.SetSize(msg.Width, msg.Height-3)
 		m.pricesTab.SetSize(msg.Width, msg.Height-3)
+		m.viewGen++
 		return m, nil
 
-	case pricesLoadedMsg, tickMsg, apiCheckMsg, apiFetchedMsg, historyCheckMsg, historyFetchedMsg:
+	case pricesLoadedMsg:
+		newTab, cmd := m.pricesTab.Update(msg)
+		m.pricesTab = newTab
+		m.viewGen++
+		return m, cmd
+
+	case tickMsg:
+		newTab, cmd := m.pricesTab.Update(msg)
+		m.pricesTab = newTab
+		return m, cmd
+
+	case apiCheckMsg:
+		newTab, cmd := m.pricesTab.Update(msg)
+		m.pricesTab = newTab
+		return m, cmd
+
+	case apiFetchedMsg:
+		newTab, cmd := m.pricesTab.Update(msg)
+		m.pricesTab = newTab
+		return m, cmd
+
+	case historyCheckMsg:
+		newTab, cmd := m.pricesTab.Update(msg)
+		m.pricesTab = newTab
+		return m, cmd
+
+	case historyFetchedMsg:
 		newTab, cmd := m.pricesTab.Update(msg)
 		m.pricesTab = newTab
 		return m, cmd
@@ -76,10 +114,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			handled, cmd := m.itemsTab.HandleLeftRight(-1)
 			if handled {
 				m.pricesTab.SetLangIdx(m.itemsTab.langIdx)
+				m.viewGen++
 				return m, tea.Batch(cmd, m.pricesTab.refreshPrices())
 			}
 			if m.active != tabItems {
 				m.active = tabItems
+				m.viewGen++
 				return m, nil
 			}
 
@@ -87,10 +127,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			handled, cmd := m.itemsTab.HandleLeftRight(1)
 			if handled {
 				m.pricesTab.SetLangIdx(m.itemsTab.langIdx)
+				m.viewGen++
 				return m, tea.Batch(cmd, m.pricesTab.refreshPrices())
 			}
 			if m.active != tabPrices {
 				m.active = tabPrices
+				m.viewGen++
 				return m, nil
 			}
 
@@ -112,15 +154,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tabItems:
 		newTab, cmd := m.itemsTab.Update(msg)
 		m.itemsTab = newTab
-		if _, ok := msg.(trackedLoadedMsg); ok {
+		if tmsg, ok := msg.(trackedLoadedMsg); ok {
 			m.pricesTab.lastHistory = time.Time{}
 			_, cmd2 := m.pricesTab.Update(apiCheckMsg{})
-			return m, tea.Batch(cmd, cmd2)
+			m.viewGen++
+			_ = tmsg
+			return m, tea.Batch(cmd, cmd2, m.pricesTab.refreshPrices())
+		}
+		if _, ok := msg.(searchResultsMsg); ok {
+			m.viewGen++
 		}
 		return m, cmd
 	case tabPrices:
 		newTab, cmd := m.pricesTab.Update(msg)
 		m.pricesTab = newTab
+		if _, ok := msg.(tea.KeyMsg); ok {
+			m.viewGen++
+		}
 		return m, cmd
 	}
 
@@ -128,6 +178,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) View() string {
+	if m.active == tabPrices && m.viewGen == modelViewCache.gen && modelViewCache.view != "" {
+		return modelViewCache.view
+	}
+
 	tabBar := m.renderTabBar()
 
 	var content string
@@ -140,7 +194,12 @@ func (m Model) View() string {
 
 	help := m.renderHelp()
 
-	return lipgloss.JoinVertical(lipgloss.Top, tabBar, content, help)
+	result := lipgloss.JoinVertical(lipgloss.Top, tabBar, content, help)
+	if m.active == tabPrices {
+		modelViewCache.gen = m.viewGen
+		modelViewCache.view = result
+	}
+	return result
 }
 
 func (m Model) renderTabBar() string {

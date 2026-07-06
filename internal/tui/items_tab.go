@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"database/sql"
 	"fmt"
 	"strconv"
 	"strings"
@@ -10,8 +9,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"albion-helper/internal/db"
 	"albion-helper/internal/models"
+	"albion-helper/internal/service"
 )
 
 type focusZone int
@@ -24,8 +23,8 @@ const (
 )
 
 const (
-	searchResultLimit    = 30
-	resultsVisibleLines  = 5
+	searchResultLimit   = 30
+	resultsVisibleLines = 5
 )
 
 var (
@@ -39,7 +38,7 @@ var (
 )
 
 type ItemsTabModel struct {
-	db       *sql.DB
+	itemSvc  service.ItemService
 	focus    focusZone
 	langIdx  int
 	width    int
@@ -60,23 +59,23 @@ type ItemsTabModel struct {
 	enchantItemID   string
 }
 
-func NewItemsTabModel(database *sql.DB) ItemsTabModel {
+func NewItemsTabModel(svc service.ItemService) ItemsTabModel {
 	ti := textinput.New()
 	ti.Placeholder = "Search items..."
 	ti.CharLimit = 60
 	ti.Focus()
 
 	langIdx := 0
-	if saved := db.GetSetting(database, "lang_idx"); saved != "" {
-		if v, err := strconv.Atoi(saved); err == nil && v >= 0 && v < len(db.Languages) {
+	if saved := svc.GetSetting("lang_idx"); saved != "" {
+		if v, err := strconv.Atoi(saved); err == nil && v >= 0 && v < len(models.Languages) {
 			langIdx = v
 		}
 	}
 
 	return ItemsTabModel{
-		db:         database,
-		focus:      focusSearch,
-		langIdx:    langIdx,
+		itemSvc:     svc,
+		focus:       focusSearch,
+		langIdx:     langIdx,
 		searchInput: ti,
 	}
 }
@@ -89,11 +88,11 @@ func (m *ItemsTabModel) Init() tea.Cmd {
 }
 
 func (m *ItemsTabModel) loadTracked() tea.Cmd {
-	database := m.db
 	langIdx := m.langIdx
+	svc := m.itemSvc
 	return func() tea.Msg {
-		lang := db.Languages[langIdx].Code
-		items, err := db.GetTrackedItems(database, lang)
+		lang := models.Languages[langIdx].Code
+		items, err := svc.GetTracked(lang)
 		if err != nil {
 			return nil
 		}
@@ -106,7 +105,7 @@ type trackedLoadedMsg []models.TrackedItem
 func (m *ItemsTabModel) SetSize(w, h int) {
 	m.width = w
 	m.height = h
-	langLabel := fmt.Sprintf("Lang: %s", db.Languages[m.langIdx].Code)
+	langLabel := fmt.Sprintf("Lang: %s", models.Languages[m.langIdx].Code)
 	langWidth := lipgloss.Width(styleDimmed.Render(langLabel))
 	inputWidth := w - langWidth - 4
 	if inputWidth < 10 {
@@ -140,17 +139,22 @@ func (m *ItemsTabModel) HandleLeftRight(dir int) (bool, tea.Cmd) {
 	if m.focus == focusSearch && m.searchInput.Value() == "" {
 		m.langIdx += dir
 		if m.langIdx < 0 {
-			m.langIdx = len(db.Languages) - 1
+			m.langIdx = len(models.Languages) - 1
 		}
-		if m.langIdx >= len(db.Languages) {
+		if m.langIdx >= len(models.Languages) {
 			m.langIdx = 0
 		}
-		db.SetSetting(m.db, "lang_idx", strconv.Itoa(m.langIdx))
+		langIdx := m.langIdx
+		svc := m.itemSvc
+		setCmd := func() tea.Msg {
+			_ = svc.SetSetting("lang_idx", strconv.Itoa(langIdx))
+			return nil
+		}
 		m.results = nil
 		m.resultsCursor = 0
 		m.lastQuery = ""
 		m.searchInput.Reset()
-		return true, m.loadTracked()
+		return true, tea.Batch(m.loadTracked(), setCmd)
 	}
 	return false, nil
 }
@@ -287,11 +291,11 @@ func (m ItemsTabModel) Update(msg tea.Msg) (ItemsTabModel, tea.Cmd) {
 
 func (m *ItemsTabModel) recheckTracked() tea.Cmd {
 	langIdx := m.langIdx
-	database := m.db
+	svc := m.itemSvc
 	lastQuery := m.lastQuery
 	return func() tea.Msg {
-		lang := db.Languages[langIdx].Code
-		results, err := db.SearchItems(database, lang, lastQuery, searchResultLimit)
+		lang := models.Languages[langIdx].Code
+		results, err := svc.Search(lang, lastQuery, searchResultLimit)
 		if err != nil {
 			return nil
 		}
@@ -301,10 +305,10 @@ func (m *ItemsTabModel) recheckTracked() tea.Cmd {
 
 func (m *ItemsTabModel) doSearch(query string) tea.Cmd {
 	langIdx := m.langIdx
-	database := m.db
+	svc := m.itemSvc
 	return func() tea.Msg {
-		lang := db.Languages[langIdx].Code
-		results, err := db.SearchItems(database, lang, query, searchResultLimit)
+		lang := models.Languages[langIdx].Code
+		results, err := svc.Search(lang, query, searchResultLimit)
 		if err != nil {
 			return nil
 		}
@@ -315,27 +319,25 @@ func (m *ItemsTabModel) doSearch(query string) tea.Cmd {
 type searchResultsMsg []models.SearchResult
 
 func (m *ItemsTabModel) trackItem(uniqueName string, enchantment, quality int) tea.Cmd {
-	database := m.db
+	svc := m.itemSvc
 	langIdx := m.langIdx
 	return func() tea.Msg {
-		if err := db.AddTrackedItem(database, uniqueName, enchantment, quality); err != nil {
+		items, err := svc.TrackItem(uniqueName, enchantment, quality, models.Languages[langIdx].Code)
+		if err != nil {
 			return nil
 		}
-		lang := db.Languages[langIdx].Code
-		items, _ := db.GetTrackedItems(database, lang)
 		return trackedLoadedMsg(items)
 	}
 }
 
 func (m *ItemsTabModel) untrackItem(uniqueName string, enchantment, quality int) tea.Cmd {
-	database := m.db
+	svc := m.itemSvc
 	langIdx := m.langIdx
 	return func() tea.Msg {
-		if err := db.RemoveTrackedItem(database, uniqueName, enchantment, quality); err != nil {
+		items, err := svc.UntrackItem(uniqueName, enchantment, quality, models.Languages[langIdx].Code)
+		if err != nil {
 			return nil
 		}
-		lang := db.Languages[langIdx].Code
-		items, _ := db.GetTrackedItems(database, lang)
 		return trackedLoadedMsg(items)
 	}
 }
@@ -409,7 +411,7 @@ func (m ItemsTabModel) renderPicker() string {
 }
 
 func (m ItemsTabModel) renderSearchLine() string {
-	lang := db.Languages[m.langIdx]
+	lang := models.Languages[m.langIdx]
 	langLabel := fmt.Sprintf("Lang: %s", lang.Code)
 	if m.focus == focusSearch && m.searchInput.Value() == "" {
 		langLabel = styleSelected.Render(langLabel)
@@ -436,7 +438,7 @@ func (m ItemsTabModel) renderResultsSection() string {
 	}
 	header += styleDimmed.Render(strings.Repeat("─", padLen))
 
-	var lines []string
+	lines := make([]string, 0, resultsVisibleLines+2)
 	lines = append(lines, header)
 
 	if len(m.results) == 0 && m.lastQuery != "" {
@@ -500,7 +502,7 @@ func (m ItemsTabModel) renderTrackedSection(maxHeight int) string {
 	}
 	header += styleDimmed.Render(strings.Repeat("─", padLen))
 
-	var lines []string
+	lines := make([]string, 0, maxHeight+1)
 	lines = append(lines, header)
 
 	if len(m.tracked) == 0 {

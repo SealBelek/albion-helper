@@ -20,6 +20,24 @@ type LanguageInfo struct {
 	FTS  string
 }
 
+var Languages = []LanguageInfo{
+	{Code: "EN-US", Name: "English", FTS: "european"},
+	{Code: "DE-DE", Name: "Deutsch", FTS: "european"},
+	{Code: "FR-FR", Name: "Français", FTS: "european"},
+	{Code: "RU-RU", Name: "Русский", FTS: "european"},
+	{Code: "PL-PL", Name: "Polski", FTS: "european"},
+	{Code: "ES-ES", Name: "Español", FTS: "european"},
+	{Code: "PT-BR", Name: "Português", FTS: "european"},
+	{Code: "IT-IT", Name: "Italiano", FTS: "european"},
+	{Code: "ID-ID", Name: "Indonesia", FTS: "european"},
+	{Code: "TR-TR", Name: "Türkçe", FTS: "european"},
+	{Code: "AR-SA", Name: "العربية", FTS: "european"},
+	{Code: "ZH-CN", Name: "简体中文", FTS: "cjk"},
+	{Code: "ZH-TW", Name: "繁體中文", FTS: "cjk"},
+	{Code: "KO-KR", Name: "한국어", FTS: "cjk"},
+	{Code: "JA-JP", Name: "日本語", FTS: "cjk"},
+}
+
 type MarketOrder struct {
 	ID               int    `json:"Id"`
 	ItemID           string `json:"ItemTypeId"`

@@ -36,15 +36,23 @@ type historyDataPoint struct {
 }
 
 type historyResponse struct {
-	Location string            `json:"location"`
-	ItemID   string            `json:"item_id"`
-	Quality  int               `json:"quality"`
+	Location string             `json:"location"`
+	ItemID   string             `json:"item_id"`
+	Quality  int                `json:"quality"`
 	Data     []historyDataPoint `json:"data"`
 }
 
-var client = &http.Client{Timeout: 10 * time.Second}
+type Client struct {
+	http *http.Client
+}
 
-func FetchPrices(database *sql.DB, tracked []models.TrackedItem) {
+func NewClient() *Client {
+	return &Client{
+		http: &http.Client{Timeout: 10 * time.Second},
+	}
+}
+
+func (c *Client) FetchPrices(database *sql.DB, tracked []models.TrackedItem) {
 	batches := buildBatches(tracked)
 	qualities := buildQualityList(tracked)
 
@@ -52,7 +60,7 @@ func FetchPrices(database *sql.DB, tracked []models.TrackedItem) {
 		url := fmt.Sprintf("%s/api/v2/stats/prices/%s.json?qualities=%s",
 			baseURL, strings.Join(batch, ","), qualities)
 
-		resp, err := client.Get(url)
+		resp, err := c.http.Get(url)
 		if err != nil {
 			log.Printf("API prices fetch error: %v", err)
 			continue
@@ -71,7 +79,7 @@ func FetchPrices(database *sql.DB, tracked []models.TrackedItem) {
 	}
 }
 
-func FetchHistory(database *sql.DB, tracked []models.TrackedItem) {
+func (c *Client) FetchHistory(database *sql.DB, tracked []models.TrackedItem) {
 	batches := buildBatches(tracked)
 	qualities := buildQualityList(tracked)
 
@@ -79,7 +87,7 @@ func FetchHistory(database *sql.DB, tracked []models.TrackedItem) {
 		url := fmt.Sprintf("%s/api/v2/stats/history/%s.json?qualities=%s&time-scale=24",
 			baseURL, strings.Join(batch, ","), qualities)
 
-		resp, err := client.Get(url)
+		resp, err := c.http.Get(url)
 		if err != nil {
 			log.Printf("API history fetch error: %v", err)
 			continue
@@ -145,41 +153,69 @@ func buildQualityList(tracked []models.TrackedItem) string {
 }
 
 func insertPriceSnapshot(database *sql.DB, prices []priceResponse) {
+	tx, err := database.Begin()
+	if err != nil {
+		log.Printf("insertPriceSnapshot: begin tx: %v", err)
+		return
+	}
+	defer tx.Rollback()
+
 	for _, p := range prices {
 		if p.SellPriceMin == 0 && p.SellPriceMax == 0 && p.BuyPriceMin == 0 && p.BuyPriceMax == 0 {
 			continue
 		}
 
-		database.Exec("DELETE FROM marketorders WHERE source='api' AND item_id=? AND city=? AND quality_level=?",
+		tx.Exec("DELETE FROM marketorders WHERE source='api' AND item_id=? AND city=? AND quality_level=?",
 			p.ItemID, p.City, p.Quality)
 
-		insertSynthetic(database, p.ItemID, p.City, p.Quality, p.SellPriceMin, "request")
+		insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.SellPriceMin, "request")
 		if p.SellPriceMax != p.SellPriceMin && p.SellPriceMax > 0 {
-			insertSynthetic(database, p.ItemID, p.City, p.Quality, p.SellPriceMax, "request")
+			insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.SellPriceMax, "request")
 		}
 		if p.BuyPriceMin > 0 {
-			insertSynthetic(database, p.ItemID, p.City, p.Quality, p.BuyPriceMin, "offer")
+			insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.BuyPriceMin, "offer")
 			if p.BuyPriceMax != p.BuyPriceMin && p.BuyPriceMax > 0 {
-				insertSynthetic(database, p.ItemID, p.City, p.Quality, p.BuyPriceMax, "offer")
+				insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.BuyPriceMax, "offer")
 			}
 		}
 	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("insertPriceSnapshot: commit: %v", err)
+	}
 }
 
-func insertSynthetic(database *sql.DB, itemID, city string, quality, price int, auctionType string) {
-	database.Exec(`
+func insertSyntheticTx(tx *sql.Tx, itemID, city string, quality, price int, auctionType string) {
+	tx.Exec(`
 		INSERT INTO marketorders (item_id, city, quality_level, price, amount, auction_type, source)
 		VALUES (?, ?, ?, ?, 1, ?, 'api')
 	`, itemID, city, quality, price, auctionType)
 }
 
 func insertHistorySnapshot(database *sql.DB, histories []historyResponse) {
+	locNames := make(map[string]string, len(histories))
+	for _, h := range histories {
+		if len(h.Data) == 0 {
+			continue
+		}
+		if _, ok := locNames[h.Location]; !ok {
+			locNames[h.Location] = db.MarketNameForLocation(database, h.Location)
+		}
+	}
+
+	tx, err := database.Begin()
+	if err != nil {
+		log.Printf("insertHistorySnapshot: begin tx: %v", err)
+		return
+	}
+	defer tx.Rollback()
+
 	for _, h := range histories {
 		if len(h.Data) == 0 {
 			continue
 		}
 
-		locName := db.MarketNameForLocation(database, h.Location)
+		locName := locNames[h.Location]
 
 		sort.Slice(h.Data, func(i, j int) bool {
 			return h.Data[i].Timestamp > h.Data[j].Timestamp
@@ -191,25 +227,29 @@ func insertHistorySnapshot(database *sql.DB, histories []historyResponse) {
 
 		ts := parseTimestamp(h.Data[0].Timestamp)
 
-		database.Exec("DELETE FROM markethistories WHERE item_id=? AND location_id=? AND quality_level=? AND timescale=?",
+		tx.Exec("DELETE FROM markethistories WHERE item_id=? AND location_id=? AND quality_level=? AND timescale=?",
 			h.ItemID, locName, h.Quality, 0)
-		database.Exec("DELETE FROM markethistories WHERE item_id=? AND location_id=? AND quality_level=? AND timescale=?",
+		tx.Exec("DELETE FROM markethistories WHERE item_id=? AND location_id=? AND quality_level=? AND timescale=?",
 			h.ItemID, locName, h.Quality, 1)
-		database.Exec("DELETE FROM markethistories WHERE item_id=? AND location_id=? AND quality_level=? AND timescale=?",
+		tx.Exec("DELETE FROM markethistories WHERE item_id=? AND location_id=? AND quality_level=? AND timescale=?",
 			h.ItemID, locName, h.Quality, 2)
 
 		if avg1d > 0 {
-			database.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 0, 1, ?, ?)`,
+			tx.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 0, 1, ?, ?)`,
 				h.ItemID, locName, h.Quality, avg1d, ts)
 		}
 		if avg7d > 0 {
-			database.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 1, 1, ?, ?)`,
+			tx.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 1, 1, ?, ?)`,
 				h.ItemID, locName, h.Quality, avg7d, ts)
 		}
 		if avg28d > 0 {
-			database.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 2, 1, ?, ?)`,
+			tx.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 2, 1, ?, ?)`,
 				h.ItemID, locName, h.Quality, avg28d, ts)
 		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Printf("insertHistorySnapshot: commit: %v", err)
 	}
 }
 
