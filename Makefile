@@ -1,4 +1,4 @@
-.PHONY: all build run lint tidy clean db-reset
+.PHONY: all build run lint tidy clean db-reset update-data
 
 BINARY := albion-helper
 CMD    := ./cmd/
@@ -23,3 +23,6 @@ clean:
 
 db-reset:
 	rm -f $(DB) $(DB)-shm $(DB)-wal
+
+update-data:
+	bash scripts/update-data.sh

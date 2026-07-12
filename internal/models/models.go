@@ -75,6 +75,39 @@ type PriceItemGroup struct {
 	HasData    bool
 }
 
+type Opportunity struct {
+	ItemID      string
+	Name        string
+	City        string
+	Quality     int
+	Enchantment int
+	BestBid     int
+	BestAsk     int
+	BuyPrice    int
+	SellPrice   int
+	Profit      int
+	ProfitPct   float64
+	DailyVolume int64
+	SuggestQty  int64
+	HasPosition bool
+	PositionBE  int
+}
+
+type Position struct {
+	ID          int64
+	ItemID      string
+	Name        string
+	City        string
+	Quality     int
+	Enchantment int
+	BuyPrice    int
+	Qty         int
+	BoughtAt    string
+	BreakEven   int
+	CurrentAsk  int
+	Ready       bool
+}
+
 type MarketHistory struct {
 	ItemAmount   int64  `json:"ItemAmount"`
 	SilverAmount uint64 `json:"SilverAmount"`

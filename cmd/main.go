@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"log"
@@ -9,11 +10,13 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
+	"strings"
 	"time"
 
 	"albion-helper/data"
 	"albion-helper/internal/api"
 	"albion-helper/internal/db"
+	"albion-helper/internal/enricher"
 	"albion-helper/internal/nats"
 	"albion-helper/internal/service"
 	"albion-helper/internal/tui"
@@ -25,6 +28,8 @@ func main() {
 	profile := flag.Bool("profile", false, "enable pprof HTTP server on localhost:6060")
 	debug := flag.Bool("debug", false, "enable debug mode: write heap profiles every 30s and log memory usage")
 	flag.Parse()
+
+	loadEnv()
 
 	database, err := db.Open("db/items.db")
 	if err != nil {
@@ -61,14 +66,36 @@ func main() {
 	}()
 	defer subscriber.Stop()
 
-	apiClient := api.NewClient()
+	apiClient := api.NewClient(os.Getenv("API_PROXY"))
+	enricher.New(database, apiClient).Start()
 	itemSvc := service.NewItemService(database)
 	priceSvc := service.NewPriceService(database, apiClient)
+	mmSvc := service.NewMarketMakerService(database)
 
-	p := tea.NewProgram(tui.NewModel(itemSvc, priceSvc), tea.WithAltScreen())
+	p := tea.NewProgram(tui.NewModel(itemSvc, priceSvc, mmSvc), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error running program: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+func loadEnv() {
+	f, err := os.Open(".env")
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		os.Setenv(strings.TrimSpace(k), strings.TrimSpace(v))
 	}
 }
 

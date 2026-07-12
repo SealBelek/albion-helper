@@ -1,3 +1,10 @@
 db/
 albion-helper
 nats.log
+.env
+data/*.bak
+.memsearch/
+.githuman/
+profiles/
+logs/
+.opencode/

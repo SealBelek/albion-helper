@@ -15,6 +15,7 @@ type tab int
 const (
 	tabItems tab = iota
 	tabPrices
+	tabMarketMaker
 )
 
 var (
@@ -32,27 +33,33 @@ var modelViewCache struct {
 type Model struct {
 	itemSvc  service.ItemService
 	priceSvc service.PriceService
+	mmSvc    service.MarketMakerService
 	active   tab
 	width    int
 	height   int
 
 	itemsTab  ItemsTabModel
 	pricesTab PricesTabModel
+	mmTab     MarketMakerTabModel
 
 	viewGen uint64
 }
 
-func NewModel(itemSvc service.ItemService, priceSvc service.PriceService) Model {
+func NewModel(itemSvc service.ItemService, priceSvc service.PriceService, mmSvc service.MarketMakerService) Model {
 	it := NewItemsTabModel(itemSvc)
 	pt := NewPricesTabModel(priceSvc)
 	pt.SetLangIdx(it.langIdx)
+	mm := NewMarketMakerTabModel(mmSvc)
+	mm.SetLangIdx(it.langIdx)
 
 	return Model{
 		itemSvc:   itemSvc,
 		priceSvc:  priceSvc,
+		mmSvc:     mmSvc,
 		active:    tabItems,
 		itemsTab:  it,
 		pricesTab: pt,
+		mmTab:     mm,
 		viewGen:   1,
 	}
 }
@@ -61,6 +68,7 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		m.itemsTab.Init(),
 		m.pricesTab.Init(),
+		m.mmTab.Init(),
 	)
 }
 
@@ -71,8 +79,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.itemsTab.SetSize(msg.Width, msg.Height-3)
 		m.pricesTab.SetSize(msg.Width, msg.Height-3)
+		m.mmTab.SetSize(msg.Width, msg.Height-3)
 		m.viewGen++
 		return m, nil
+
+	case mmLoadedMsg:
+		newTab, cmd := m.mmTab.Update(msg)
+		m.mmTab = newTab
+		m.viewGen++
+		return m, cmd
+
+	case mmTickMsg:
+		newTab, cmd := m.mmTab.Update(msg)
+		m.mmTab = newTab
+		return m, cmd
+
+	case mmActionMsg:
+		newTab, cmd := m.mmTab.Update(msg)
+		m.mmTab = newTab
+		m.viewGen++
+		return m, cmd
+
+	case mmRefreshDoneMsg:
+		newTab, cmd := m.mmTab.Update(msg)
+		m.mmTab = newTab
+		m.viewGen++
+		return m, cmd
 
 	case pricesLoadedMsg:
 		newTab, cmd := m.pricesTab.Update(msg)
@@ -114,27 +146,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			handled, cmd := m.itemsTab.HandleLeftRight(-1)
 			if handled {
 				m.pricesTab.SetLangIdx(m.itemsTab.langIdx)
+				m.mmTab.SetLangIdx(m.itemsTab.langIdx)
 				m.viewGen++
-				return m, tea.Batch(cmd, m.pricesTab.refreshPrices())
+				return m, tea.Batch(cmd, m.pricesTab.refreshPrices(), m.mmTab.loadAll())
 			}
-			if m.active != tabItems {
-				m.active = tabItems
-				m.viewGen++
-				return m, nil
-			}
+			m.active = prevTab(m.active)
+			m.viewGen++
+			return m, nil
 
 		case "right":
 			handled, cmd := m.itemsTab.HandleLeftRight(1)
 			if handled {
 				m.pricesTab.SetLangIdx(m.itemsTab.langIdx)
+				m.mmTab.SetLangIdx(m.itemsTab.langIdx)
 				m.viewGen++
-				return m, tea.Batch(cmd, m.pricesTab.refreshPrices())
+				return m, tea.Batch(cmd, m.pricesTab.refreshPrices(), m.mmTab.loadAll())
 			}
-			if m.active != tabPrices {
-				m.active = tabPrices
-				m.viewGen++
-				return m, nil
-			}
+			m.active = nextTab(m.active)
+			m.viewGen++
+			return m, nil
 
 		case "tab":
 			if m.active == tabItems {
@@ -172,9 +202,38 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.viewGen++
 		}
 		return m, cmd
+	case tabMarketMaker:
+		newTab, cmd := m.mmTab.Update(msg)
+		m.mmTab = newTab
+		if _, ok := msg.(tea.KeyMsg); ok {
+			m.viewGen++
+		}
+		return m, cmd
 	}
 
 	return m, nil
+}
+
+func nextTab(t tab) tab {
+	switch t {
+	case tabItems:
+		return tabPrices
+	case tabPrices:
+		return tabMarketMaker
+	default:
+		return tabItems
+	}
+}
+
+func prevTab(t tab) tab {
+	switch t {
+	case tabItems:
+		return tabMarketMaker
+	case tabPrices:
+		return tabItems
+	default:
+		return tabPrices
+	}
 }
 
 func (m Model) View() string {
@@ -190,6 +249,8 @@ func (m Model) View() string {
 		content = m.itemsTab.View()
 	case tabPrices:
 		content = m.pricesTab.View()
+	case tabMarketMaker:
+		content = m.mmTab.View()
 	}
 
 	help := m.renderHelp()
@@ -203,14 +264,19 @@ func (m Model) View() string {
 }
 
 func (m Model) renderTabBar() string {
-	itemsLabel := styleTabActive.Render(" Items ")
+	itemsLabel := styleTabInactive.Render(" Items ")
 	pricesLabel := styleTabInactive.Render(" Prices ")
-	if m.active == tabPrices {
-		itemsLabel = styleTabInactive.Render(" Items ")
+	mmLabel := styleTabInactive.Render(" Market Maker ")
+	switch m.active {
+	case tabItems:
+		itemsLabel = styleTabActive.Render(" Items ")
+	case tabPrices:
 		pricesLabel = styleTabActive.Render(" Prices ")
+	case tabMarketMaker:
+		mmLabel = styleTabActive.Render(" Market Maker ")
 	}
 
-	tabs := itemsLabel + pricesLabel
+	tabs := itemsLabel + pricesLabel + mmLabel
 	fillWidth := m.width - lipgloss.Width(tabs)
 	if fillWidth < 0 {
 		fillWidth = 0
@@ -236,6 +302,10 @@ func (m Model) renderHelp() string {
 
 	case tabPrices:
 		keys := "↑↓: items  r: refresh  ←→: switch tab  Ctrl+C: quit"
+		return makeHelpLine(keys, m.width)
+
+	case tabMarketMaker:
+		keys := "c: city  n/p: page  b: buy  s: sell  r: refresh  ↑↓: nav  ←→: tab  Ctrl+C: quit"
 		return makeHelpLine(keys, m.width)
 	}
 

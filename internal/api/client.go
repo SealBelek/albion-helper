@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -46,9 +47,18 @@ type Client struct {
 	http *http.Client
 }
 
-func NewClient() *Client {
+func NewClient(proxyURL string) *Client {
+	transport := &http.Transport{}
+	if proxyURL != "" {
+		if u, err := url.Parse(proxyURL); err == nil {
+			transport.Proxy = http.ProxyURL(u)
+		}
+	}
 	return &Client{
-		http: &http.Client{Timeout: 10 * time.Second},
+		http: &http.Client{
+			Timeout:   30 * time.Second,
+			Transport: transport,
+		},
 	}
 }
 
@@ -77,6 +87,44 @@ func (c *Client) FetchPrices(database *sql.DB, tracked []models.TrackedItem) {
 		insertPriceSnapshot(database, prices)
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+func (c *Client) EnrichBatch(database *sql.DB, names []string) error {
+	url := fmt.Sprintf("%s/api/v2/stats/prices/%s.json?qualities=0,1,2,3,4",
+		baseURL, strings.Join(names, ","))
+
+	resp, err := c.http.Get(url)
+	if err != nil {
+		return fmt.Errorf("enrich fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var prices []priceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&prices); err != nil {
+		return fmt.Errorf("enrich decode: %w", err)
+	}
+
+	insertPriceSnapshot(database, prices)
+	return nil
+}
+
+func (c *Client) EnrichHistory(database *sql.DB, names []string) error {
+	url := fmt.Sprintf("%s/api/v2/stats/history/%s.json?qualities=0,1,2,3,4&time-scale=24",
+		baseURL, strings.Join(names, ","))
+
+	resp, err := c.http.Get(url)
+	if err != nil {
+		return fmt.Errorf("enrich history fetch: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var histories []historyResponse
+	if err := json.NewDecoder(resp.Body).Decode(&histories); err != nil {
+		return fmt.Errorf("enrich history decode: %w", err)
+	}
+
+	insertHistorySnapshot(database, histories)
+	return nil
 }
 
 func (c *Client) FetchHistory(database *sql.DB, tracked []models.TrackedItem) {
@@ -165,17 +213,19 @@ func insertPriceSnapshot(database *sql.DB, prices []priceResponse) {
 			continue
 		}
 
+		p.City = db.MarketNameForLocation(database, p.City)
+
 		tx.Exec("DELETE FROM marketorders WHERE source='api' AND item_id=? AND city=? AND quality_level=?",
 			p.ItemID, p.City, p.Quality)
 
-		insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.SellPriceMin, "request")
+		insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.SellPriceMin, "offer")
 		if p.SellPriceMax != p.SellPriceMin && p.SellPriceMax > 0 {
-			insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.SellPriceMax, "request")
+			insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.SellPriceMax, "offer")
 		}
 		if p.BuyPriceMin > 0 {
-			insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.BuyPriceMin, "offer")
+			insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.BuyPriceMin, "request")
 			if p.BuyPriceMax != p.BuyPriceMin && p.BuyPriceMax > 0 {
-				insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.BuyPriceMax, "offer")
+				insertSyntheticTx(tx, p.ItemID, p.City, p.Quality, p.BuyPriceMax, "request")
 			}
 		}
 	}
@@ -221,9 +271,9 @@ func insertHistorySnapshot(database *sql.DB, histories []historyResponse) {
 			return h.Data[i].Timestamp > h.Data[j].Timestamp
 		})
 
-		avg1d := computeWeightedAverage(h.Data, 1)
-		avg7d := computeWeightedAverage(h.Data, 7)
-		avg28d := computeWeightedAverage(h.Data, 28)
+		avg1d, cnt1d := computeWeightedAverage(h.Data, 1)
+		avg7d, cnt7d := computeWeightedAverage(h.Data, 7)
+		avg28d, cnt28d := computeWeightedAverage(h.Data, 28)
 
 		ts := parseTimestamp(h.Data[0].Timestamp)
 
@@ -234,17 +284,20 @@ func insertHistorySnapshot(database *sql.DB, histories []historyResponse) {
 		tx.Exec("DELETE FROM markethistories WHERE item_id=? AND location_id=? AND quality_level=? AND timescale=?",
 			h.ItemID, locName, h.Quality, 2)
 
-		if avg1d > 0 {
-			tx.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 0, 1, ?, ?)`,
-				h.ItemID, locName, h.Quality, avg1d, ts)
+		if cnt1d > 0 {
+			tx.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 0, ?, ?, ?)`,
+				h.ItemID, locName, h.Quality, cnt1d, avg1d, ts)
+		} else if cnt7d > 0 {
+			tx.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 0, ?, ?, ?)`,
+				h.ItemID, locName, h.Quality, cnt7d/7, avg7d, ts)
 		}
-		if avg7d > 0 {
-			tx.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 1, 1, ?, ?)`,
-				h.ItemID, locName, h.Quality, avg7d, ts)
+		if cnt7d > 0 {
+			tx.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 1, ?, ?, ?)`,
+				h.ItemID, locName, h.Quality, cnt7d, avg7d, ts)
 		}
-		if avg28d > 0 {
-			tx.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 2, 1, ?, ?)`,
-				h.ItemID, locName, h.Quality, avg28d, ts)
+		if cnt28d > 0 {
+			tx.Exec(`INSERT INTO markethistories (item_id, location_id, quality_level, timescale, item_amount, silver_amount, timestamp) VALUES (?, ?, ?, 2, ?, ?, ?)`,
+				h.ItemID, locName, h.Quality, cnt28d, avg28d, ts)
 		}
 	}
 
@@ -261,7 +314,7 @@ func parseTimestamp(s string) int64 {
 	return t.Unix()
 }
 
-func computeWeightedAverage(data []historyDataPoint, days int) int {
+func computeWeightedAverage(data []historyDataPoint, days int) (int, int64) {
 	cutoff := time.Now().AddDate(0, 0, -days)
 	var totalSilver, totalItems int64
 	for _, d := range data {
@@ -276,7 +329,7 @@ func computeWeightedAverage(data []historyDataPoint, days int) int {
 		totalItems += int64(d.ItemCount)
 	}
 	if totalItems == 0 {
-		return 0
+		return 0, 0
 	}
-	return int(totalSilver / totalItems)
+	return int(totalSilver / totalItems), totalItems
 }
